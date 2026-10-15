@@ -8468,7 +8468,6 @@ static void *alsaCallbackHandler( void *ptr )
 #include <pulse/pulseaudio.h>
 #include <cstdio>
 
-static pa_mainloop_api *rt_pa_mainloop_api = NULL;
 struct PaDeviceInfo {
   PaDeviceInfo() : sink_index(-1), source_index(-1) {}
   int sink_index;
@@ -8508,30 +8507,59 @@ struct PulseAudioHandle {
   PulseAudioHandle() : s_play(0), s_rec(0), runnable(false) { }
 };
 
-static void rt_pa_mainloop_api_quit(int ret) {
-    rt_pa_mainloop_api->quit(rt_pa_mainloop_api, ret);
+struct PaDeviceEnumeration {
+  PaDeviceEnumeration()
+    : mainloop(NULL), sinks_done(false), sources_done(false), failed(false) {}
+  pa_mainloop_api *mainloop;
+  bool sinks_done;
+  bool sources_done;
+  bool failed;
+};
+
+static void rt_pa_mainloop_api_quit(PaDeviceEnumeration *enumeration, int ret) {
+  if (ret != 0)
+    enumeration->failed = true;
+  enumeration->mainloop->quit(enumeration->mainloop, enumeration->failed ? 1 : 0);
 }
 
-static void rt_pa_server_callback(pa_context *context, const pa_server_info *info, void *data){
-  (void)context;
-  (void)data;
-  pa_sample_spec ss;
+static void rt_pa_device_list_complete(PaDeviceEnumeration *enumeration, int eol) {
+  if (eol < 0) {
+    rt_pa_mainloop_api_quit(enumeration, 1);
+    return;
+  }
+  if (enumeration->failed || !enumeration->sinks_done || !enumeration->sources_done)
+    return;
 
-  if (!info)
-    rt_pa_mainloop_api_quit(1);
-
-  ss = info->sample_spec;
-
-  rt_pa_info.default_rate = ss.rate;
-  rt_pa_info.default_sink_name = info->default_sink_name;
-  rt_pa_info.default_source_name = info->default_source_name;
-  rt_pa_mainloop_api_quit(0);
+  // Keep the default output at index zero even if the default source arrived last.
+  // On input-only servers, prefer the default input instead.
+  std::vector<PaDeviceInfo>::iterator defaultDevice = rt_pa_info.dev.end();
+  for (std::vector<PaDeviceInfo>::iterator device = rt_pa_info.dev.begin();
+       device != rt_pa_info.dev.end(); ++device) {
+    if (device->info.isDefaultOutput) {
+      defaultDevice = device;
+      break;
+    }
+    if (device->info.isDefaultInput)
+      defaultDevice = device;
+  }
+  if (defaultDevice != rt_pa_info.dev.end())
+    std::rotate(rt_pa_info.dev.begin(), defaultDevice, defaultDevice + 1);
+  rt_pa_mainloop_api_quit(enumeration, 0);
 }
 
 static void rt_pa_sink_info_cb(pa_context * /*c*/, const pa_sink_info *i,
-                               int eol, void * /*userdata*/)
+                               int eol, void *userdata)
 {
-  if (eol) return;
+  PaDeviceEnumeration *enumeration = static_cast<PaDeviceEnumeration *>(userdata);
+  if (eol) {
+    enumeration->sinks_done = eol > 0;
+    rt_pa_device_list_complete(enumeration, eol);
+    return;
+  }
+  if (!i) {
+    rt_pa_mainloop_api_quit(enumeration, 1);
+    return;
+  }
   PaDeviceInfo inf;
   inf.info.name = pa_proplist_gets(i->proplist, "device.description");
   inf.info.probed = true;
@@ -8570,9 +8598,18 @@ static void rt_pa_sink_info_cb(pa_context * /*c*/, const pa_sink_info *i,
 }
 
 static void rt_pa_source_info_cb(pa_context * /*c*/, const pa_source_info *i,
-                                 int eol, void * /*userdata*/)
+                                 int eol, void *userdata)
 {
-  if (eol) return;
+  PaDeviceEnumeration *enumeration = static_cast<PaDeviceEnumeration *>(userdata);
+  if (eol) {
+    enumeration->sources_done = eol > 0;
+    rt_pa_device_list_complete(enumeration, eol);
+    return;
+  }
+  if (!i) {
+    rt_pa_mainloop_api_quit(enumeration, 1);
+    return;
+  }
   PaDeviceInfo inf;
   inf.info.name = pa_proplist_gets(i->proplist, "device.description");
   inf.info.probed = true;
@@ -8613,8 +8650,35 @@ static void rt_pa_source_info_cb(pa_context * /*c*/, const pa_source_info *i,
     rt_pa_info.dev.push_back(inf);
 }
 
+static void rt_pa_server_callback(pa_context *context, const pa_server_info *info,
+                                  void *userdata) {
+  PaDeviceEnumeration *enumeration = static_cast<PaDeviceEnumeration *>(userdata);
+  if (!info) {
+    rt_pa_mainloop_api_quit(enumeration, 1);
+    return;
+  }
+
+  rt_pa_info.default_rate = info->sample_spec.rate;
+  rt_pa_info.default_sink_name = info->default_sink_name ? info->default_sink_name : "";
+  rt_pa_info.default_source_name = info->default_source_name ? info->default_source_name : "";
+
+  // Device callbacks need the server defaults, and both lists must reach EOL.
+  pa_operation *operation = pa_context_get_sink_info_list(context, rt_pa_sink_info_cb, userdata);
+  if (!operation) {
+    rt_pa_mainloop_api_quit(enumeration, 1);
+    return;
+  }
+  pa_operation_unref(operation);
+  operation = pa_context_get_source_info_list(context, rt_pa_source_info_cb, userdata);
+  if (!operation) {
+    rt_pa_mainloop_api_quit(enumeration, 1);
+    return;
+  }
+  pa_operation_unref(operation);
+}
+
 static void rt_pa_context_state_callback(pa_context *context, void *userdata) {
-  (void)userdata;
+  PaDeviceEnumeration *enumeration = static_cast<PaDeviceEnumeration *>(userdata);
 
   switch (pa_context_get_state(context)) {
     case PA_CONTEXT_CONNECTING:
@@ -8622,20 +8686,22 @@ static void rt_pa_context_state_callback(pa_context *context, void *userdata) {
     case PA_CONTEXT_SETTING_NAME:
       break;
 
-    case PA_CONTEXT_READY:
-      rt_pa_info.dev.clear();
-      pa_context_get_server_info(context, rt_pa_server_callback, NULL);
-      pa_context_get_sink_info_list(context, rt_pa_sink_info_cb, NULL);
-      pa_context_get_source_info_list(context, rt_pa_source_info_cb, NULL);
+    case PA_CONTEXT_READY: {
+      pa_operation *operation = pa_context_get_server_info(context, rt_pa_server_callback, userdata);
+      if (operation)
+        pa_operation_unref(operation);
+      else
+        rt_pa_mainloop_api_quit(enumeration, 1);
       break;
+    }
 
     case PA_CONTEXT_TERMINATED:
-      rt_pa_mainloop_api_quit(0);
+      rt_pa_mainloop_api_quit(enumeration, 1);
       break;
 
     case PA_CONTEXT_FAILED:
     default:
-      rt_pa_mainloop_api_quit(1);
+      rt_pa_mainloop_api_quit(enumeration, 1);
   }
 }
 
@@ -8651,49 +8717,68 @@ void RtApiPulse::collectDeviceInfo( void )
   pa_mainloop *m = NULL;
   char *server = NULL;
   int ret = 1;
+  bool reportWarning = true;
+  PaDeviceEnumeration enumeration;
+
+  rt_pa_info.dev.clear();
+  rt_pa_info.default_sink_name.clear();
+  rt_pa_info.default_source_name.clear();
+  rt_pa_info.default_rate = 0;
 
   if (!(m = pa_mainloop_new())) {
     errorStream_ << "RtApiPulse::DeviceInfo pa_mainloop_new() failed.";
-    errorText_ = errorStream_.str();
-    error( RtAudioError::WARNING );
     goto quit;
   }
 
-  rt_pa_mainloop_api = pa_mainloop_get_api(m);
+  enumeration.mainloop = pa_mainloop_get_api(m);
 
-  if (!(context = pa_context_new_with_proplist(rt_pa_mainloop_api, NULL, NULL))) {
+  if (!(context = pa_context_new_with_proplist(enumeration.mainloop, NULL, NULL))) {
     errorStream_ << "pa_context_new() failed.";
-    errorText_ = errorStream_.str();
-    error( RtAudioError::WARNING );
     goto quit;
   }
 
-  pa_context_set_state_callback(context, rt_pa_context_state_callback, NULL);
+  pa_context_set_state_callback(context, rt_pa_context_state_callback, &enumeration);
 
   if (pa_context_connect(context, server, PA_CONTEXT_NOFLAGS, NULL) < 0) {
     errorStream_ << "RtApiPulse::DeviceInfo pa_context_connect() failed: "
       << pa_strerror(pa_context_errno(context));
-    errorText_ = errorStream_.str();
-    error( RtAudioError::WARNING );
     goto quit;
   }
 
   if (pa_mainloop_run(m, &ret) < 0) {
+    ret = 1;
     errorStream_ << "pa_mainloop_run() failed.";
-    errorText_ = errorStream_.str();
-    error( RtAudioError::WARNING );
     goto quit;
   }
 
+  if (ret != 0) {
+    errorStream_ << "RtApiPulse::DeviceInfo device enumeration failed";
+    if (pa_context_errno(context) != PA_OK)
+      errorStream_ << ": " << pa_strerror(pa_context_errno(context));
+    errorStream_ << ".";
+  }
+  else
+    reportWarning = false;
+
 quit:
-  if (context)
+  if (ret != 0)
+    rt_pa_info.dev.clear();
+  if (context) {
+    pa_context_set_state_callback(context, NULL, NULL);
+    // This also cancels unfinished queries before their stack userdata expires.
+    pa_context_disconnect(context);
     pa_context_unref(context);
+  }
 
   if (m) {
     pa_mainloop_free(m);
   }
 
   pa_xfree(server);
+  if (reportWarning) {
+    errorText_ = errorStream_.str();
+    error( RtAudioError::WARNING );
+  }
 }
 
 unsigned int RtApiPulse::getDeviceCount( void )
