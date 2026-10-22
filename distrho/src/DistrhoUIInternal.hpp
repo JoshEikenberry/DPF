@@ -19,6 +19,12 @@
 
 #include "DistrhoUIPrivateData.hpp"
 
+// Standalone event-loop idle wait, in milliseconds. Other consumers retain
+// DGL's 30 ms default unless explicitly overridden at compile time.
+#ifndef DISTRHO_UI_STANDALONE_IDLE_TIME_IN_MS
+# define DISTRHO_UI_STANDALONE_IDLE_TIME_IN_MS 30
+#endif
+
 START_NAMESPACE_DISTRHO
 
 // --------------------------------------------------------------------------------------------------------------------
@@ -194,7 +200,7 @@ public:
         uiData->window->show();
         uiData->window->focus();
         uiData->app.addIdleCallback(cb);
-        uiData->app.exec();
+        uiData->app.exec(DISTRHO_UI_STANDALONE_IDLE_TIME_IN_MS);
         uiData->app.removeIdleCallback(cb);
     }
 
